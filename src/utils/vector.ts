@@ -1,0 +1,30 @@
+/**
+ * Cosine distance helpers for the blob vector fallback backend.
+ */
+
+/** Cosine distance = 1 - cosine_similarity (matches sqlite-vec cosine metric). */
+export function cosineDistance(a: Float32Array, b: Float32Array): number {
+  const len = Math.min(a.length, b.length);
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < len; i += 1) {
+    const av = a[i] ?? 0;
+    const bv = b[i] ?? 0;
+    dot += av * bv;
+    normA += av * av;
+    normB += bv * bv;
+  }
+  if (normA === 0 || normB === 0) {
+    return 1;
+  }
+  const similarity = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  return 1 - similarity;
+}
+
+/** Decode a float32 embedding from a SQLite BLOB. */
+export function bufferToEmbedding(data: Uint8Array | Buffer): Float32Array {
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(data);
+  return new Float32Array(copy.buffer);
+}
