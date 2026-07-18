@@ -12,38 +12,46 @@ export const SQL = {
   insertMemory: `
     INSERT INTO memories (
       id, organization, agent, content_text, metadata_json,
-      archived, compressed_into, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?)
+      archived, compressed_into, content_hash, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)
     RETURNING rowid, id, organization, agent, content_text, metadata_json,
-              archived, compressed_into, created_at, updated_at
+              archived, compressed_into, content_hash, created_at, updated_at
   `,
 
   getMemoryById: `
     SELECT rowid, id, organization, agent, content_text, metadata_json,
-           archived, compressed_into, created_at, updated_at
+           archived, compressed_into, content_hash, created_at, updated_at
     FROM memories
     WHERE id = ? AND organization = ?
   `,
 
   getMemoryByRowid: `
     SELECT rowid, id, organization, agent, content_text, metadata_json,
-           archived, compressed_into, created_at, updated_at
+           archived, compressed_into, content_hash, created_at, updated_at
     FROM memories
     WHERE rowid = ? AND organization = ?
   `,
 
   getMemoriesByRowidsPrefix: `
     SELECT rowid, id, organization, agent, content_text, metadata_json,
-           archived, compressed_into, created_at, updated_at
+           archived, compressed_into, content_hash, created_at, updated_at
     FROM memories
     WHERE organization = ? AND rowid IN (
   `,
 
   listMemoriesBase: `
     SELECT rowid, id, organization, agent, content_text, metadata_json,
-           archived, compressed_into, created_at, updated_at
+           archived, compressed_into, content_hash, created_at, updated_at
     FROM memories
     WHERE organization = ?
+  `,
+
+  findActiveByContentHash: `
+    SELECT rowid, id, organization, agent, content_text, metadata_json,
+           archived, compressed_into, content_hash, created_at, updated_at
+    FROM memories
+    WHERE organization = ? AND agent = ? AND content_hash = ? AND archived = 0
+    LIMIT 1
   `,
 
   insertEmbedding: `
@@ -148,6 +156,7 @@ export const SQL = {
     UPDATE memories
     SET content_text = COALESCE(?, content_text),
         metadata_json = COALESCE(?, metadata_json),
+        content_hash = COALESCE(?, content_hash),
         updated_at = ?
     WHERE id = ? AND organization = ?
   `,
@@ -159,5 +168,60 @@ export const SQL = {
 
   deleteFts: `
     DELETE FROM memories_fts WHERE memory_id = ?
+  `,
+
+  deleteFtsByOrg: `
+    DELETE FROM memories_fts WHERE organization = ?
+  `,
+
+  deleteFtsByOrgAgent: `
+    DELETE FROM memories_fts WHERE organization = ? AND agent = ?
+  `,
+
+  deleteEmbeddingsByOrg: `
+    DELETE FROM memory_embeddings WHERE memory_rowid IN (
+      SELECT rowid FROM memories WHERE organization = ?
+    )
+  `,
+
+  deleteEmbeddingsByOrgAgent: `
+    DELETE FROM memory_embeddings WHERE memory_rowid IN (
+      SELECT rowid FROM memories WHERE organization = ? AND agent = ?
+    )
+  `,
+
+  deleteEmbeddingsBlobByOrg: `
+    DELETE FROM memory_embeddings_blob WHERE memory_rowid IN (
+      SELECT rowid FROM memories WHERE organization = ?
+    )
+  `,
+
+  deleteEmbeddingsBlobByOrgAgent: `
+    DELETE FROM memory_embeddings_blob WHERE memory_rowid IN (
+      SELECT rowid FROM memories WHERE organization = ? AND agent = ?
+    )
+  `,
+
+  deleteArchivedEmbeddings: `
+    DELETE FROM memory_embeddings WHERE memory_rowid IN (
+      SELECT rowid FROM memories WHERE archived = 1
+    )
+  `,
+
+  deleteArchivedEmbeddingsBlob: `
+    DELETE FROM memory_embeddings_blob WHERE memory_rowid IN (
+      SELECT rowid FROM memories WHERE archived = 1
+    )
+  `,
+
+  /** Single-pass org stats (avoids 4 separate COUNT queries). */
+  getStats: `
+    SELECT
+      COUNT(*) AS total,
+      COALESCE(SUM(CASE WHEN archived = 0 THEN 1 ELSE 0 END), 0) AS active,
+      COALESCE(SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END), 0) AS archived,
+      COUNT(DISTINCT CASE WHEN archived = 0 THEN agent END) AS agents
+    FROM memories
+    WHERE organization = ?
   `,
 } as const;

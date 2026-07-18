@@ -88,6 +88,24 @@ export class DatabaseError extends WolbargError {
   }
 }
 
+/**
+ * Thrown when SQLite write-lock retries are exhausted.
+ * Stable code: WOLBARG_STORAGE_LOCKED
+ */
+export class StorageLockedError extends WolbargError {
+  constructor(
+    message: string,
+    options?: ErrorOptions & {
+      reason?: string;
+      suggestion?: string;
+      operation?: string;
+    },
+  ) {
+    super(message, "WOLBARG_STORAGE_LOCKED", options);
+    this.name = "StorageLockedError";
+  }
+}
+
 /** Thrown when an embedding request fails. */
 export class EmbeddingError extends WolbargError {
   constructor(
@@ -164,11 +182,12 @@ export function wrapOperationError(
   const lower = raw.toLowerCase();
 
   if (lower.includes("database is locked") || lower.includes("sqlite_busy")) {
-    return new DatabaseError(formatOperationMessage(operation, raw), {
+    return new StorageLockedError(formatOperationMessage(operation, raw), {
       cause: error instanceof Error ? error : undefined,
       operation,
       reason: "SQLite database locked",
-      suggestion: "Increase timeout or reduce concurrent writes.",
+      suggestion:
+        "Increase concurrency.maxRetries or concurrency.lockTimeoutMs, or consider the Postgres backend for high-concurrency multi-agent workloads.",
     });
   }
 

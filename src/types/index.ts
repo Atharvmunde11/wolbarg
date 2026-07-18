@@ -40,8 +40,10 @@ export interface PostgresDatabaseConfig {
   connectionString?: string;
   /** v0.3 preferred alias for the Postgres connection string. */
   url?: string;
-  /** Optional max pool size. Defaults to 10. */
+  /** Optional max pool size. Defaults to 64. */
   maxPoolSize?: number;
+  /** When false, uses asynchronous commit for higher write throughput. */
+  durableWrites?: boolean;
 }
 
 /** Discriminated union of database configs. */
@@ -128,6 +130,34 @@ export interface InitOptions {
   llm?: LlmConfig;
 }
 
+/** Write-time memory dedupe strategy. */
+export type MemoryDedupeStrategy = "exact" | "near" | "exact-or-near";
+
+/** Constructor / per-call memory dedupe configuration. */
+export interface MemoryDedupeConfig {
+  enabled?: boolean;
+  strategy?: MemoryDedupeStrategy;
+  /** Cosine similarity threshold for near-dup matching. Default 0.92 */
+  nearThreshold?: number;
+  /** Max vector candidates considered for near-dup. Default 8 */
+  nearCandidateLimit?: number;
+}
+
+/** SQLite multi-writer concurrency tuning. */
+export interface ConcurrencyConfig {
+  maxRetries?: number;
+  baseBackoffMs?: number;
+  maxBackoffMs?: number;
+  lockTimeoutMs?: number;
+}
+
+/** Transparent embedding cache configuration. */
+export interface EmbeddingCacheConfig {
+  enabled?: boolean;
+  ttlMs?: number;
+  maxEntries?: number;
+}
+
 /** Input for {@link Wolbarg.remember}. */
 export interface RememberOptions {
   /** Agent identifier that owns this memory. */
@@ -136,6 +166,16 @@ export interface RememberOptions {
   content: MemoryContent;
   /** Optional opaque metadata. Stored and returned as-is. */
   metadata?: MemoryMetadata;
+  /** Per-call dedupe override; undefined uses constructor `memory.dedupe`. */
+  dedupe?: boolean | MemoryDedupeConfig;
+}
+
+/** Whether remember created a new row or updated an existing one. */
+export type RememberAction = "created" | "updated";
+
+/** Result of {@link Wolbarg.remember} — MemoryRecord plus upsert action. */
+export interface RememberResult extends MemoryRecord {
+  action: RememberAction;
 }
 
 /** Optional filter applied to recall / forget / compress operations. */
@@ -306,7 +346,7 @@ export interface HistoryOptions {
 export interface HistoryEvent {
   id: string;
   memoryId: string;
-  eventType: "created" | "archived" | "compressed";
+  eventType: "created" | "archived" | "compressed" | "updated";
   relatedMemoryId: string | null;
   createdAt: Date;
 }

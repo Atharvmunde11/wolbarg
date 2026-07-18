@@ -113,6 +113,9 @@ export function normalizeDatabaseConfig(
       ...("maxPoolSize" in config && config.maxPoolSize !== undefined
         ? { maxPoolSize: config.maxPoolSize }
         : {}),
+      ...("durableWrites" in config && config.durableWrites !== undefined
+        ? { durableWrites: config.durableWrites }
+        : {}),
     };
   }
   return {

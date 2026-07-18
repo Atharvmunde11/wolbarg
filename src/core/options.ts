@@ -13,9 +13,12 @@ import type { StorageProvider } from "../storage/types.js";
 import type { CheckpointProvider } from "../providers/interfaces/CheckpointProvider.js";
 import type { TelemetryProvider } from "../providers/interfaces/TelemetryProvider.js";
 import type {
+  ConcurrencyConfig,
   DatabaseConfig,
+  EmbeddingCacheConfig,
   EmbeddingConfig,
   LlmConfig,
+  MemoryDedupeConfig,
   RetrievalConfig,
   StorageConfig,
   TelemetryConfig,
@@ -60,6 +63,14 @@ export interface WolbargOptionsBase {
   chunking?: ChunkingStrategy;
   /** Optional retrieval defaults. */
   retrieval?: RetrievalConfig;
+  /** SQLite multi-writer concurrency tuning (ignored for Postgres). */
+  concurrency?: ConcurrencyConfig;
+  /** Transparent embedding cache (default enabled). */
+  embeddingCache?: EmbeddingCacheConfig;
+  /** Memory write-path options (dedupe / upsert). */
+  memory?: {
+    dedupe?: MemoryDedupeConfig;
+  };
 }
 
 export interface WolbargOptionsWithoutLlm extends WolbargOptionsBase {

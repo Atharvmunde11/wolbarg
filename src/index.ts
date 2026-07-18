@@ -41,6 +41,12 @@ export type {
   RecallOptions,
   RecallResult,
   RememberOptions,
+  RememberResult,
+  RememberAction,
+  ConcurrencyConfig,
+  EmbeddingCacheConfig,
+  MemoryDedupeConfig,
+  MemoryDedupeStrategy,
   RetrievalConfig,
   SqliteDatabaseConfig,
   StatsResult,
@@ -48,6 +54,14 @@ export type {
   StorageProviderName,
   TelemetryConfig,
 } from "./types/index.js";
+
+export type {
+  MemoryChangeEvent,
+  MemoryChangeCallback,
+  SubscribableEvent,
+  SubscribeFilter,
+  Unsubscribe,
+} from "./subscribe/index.js";
 
 export type {
   WolbargOptions,
@@ -64,6 +78,7 @@ export {
   InitializationError,
   MemoryNotFoundError,
   ProviderNotConfiguredError,
+  StorageLockedError,
   ValidationError,
   wrapOperationError,
 } from "./errors/index.js";

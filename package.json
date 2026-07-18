@@ -1,6 +1,6 @@
 {
   "name": "wolbarg",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Wolbarg — modular, provider-agnostic semantic memory SDK for AI agents. SQLite + PostgreSQL, hybrid search, ingest, optional rerankers.",
   "license": "MIT",
   "author": {
@@ -98,15 +98,15 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Atharvmunde11/wolbarg.git"
+    "url": "git+https://github.com/wolbarg/wolbarg.git"
   },
   "bugs": {
-    "url": "https://github.com/Atharvmunde11/wolbarg/issues"
+    "url": "https://github.com/wolbarg/wolbarg/issues"
   },
-  "homepage": "https://wolbarg.com",
+  "homepage": "https://github.com/wolbarg/wolbarg#readme",
   "funding": {
     "type": "github",
-    "url": "https://github.com/Atharvmunde11/wolbarg"
+    "url": "https://github.com/wolbarg/wolbarg"
   },
   "optionalDependencies": {
     "mammoth": "^1.12.0",

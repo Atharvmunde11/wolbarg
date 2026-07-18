@@ -17,13 +17,16 @@ import * as sqliteVec from "sqlite-vec";
 
 import { DatabaseError, InitializationError } from "../../errors/index.js";
 import { matchesMetadata } from "../../filters/match.js";
+import { compileMetadataFilterToSql } from "../../filters/sql-compile.js";
 import {
   CREATE_BLOB_EMBEDDINGS_TABLE,
+  CREATE_EMBEDDING_CACHE_TABLE,
   CREATE_FTS_TABLE,
   CREATE_HISTORY_TABLE,
   CREATE_INDEXES,
   CREATE_MEMORIES_TABLE,
   CREATE_META_TABLE,
+  DROP_REDUNDANT_INDEXES_V4,
   META_KEYS,
   SCHEMA_VERSION,
   buildVectorTableSql,
@@ -49,6 +52,27 @@ import type {
   UpdateMemoryInput,
   VectorSearchHit,
 } from "../types.js";
+import {
+  resolveConcurrencyConfig,
+  type ConcurrencyConfig,
+  type ResolvedConcurrencyConfig,
+} from "../sqlite/concurrency-config.js";
+import { withImmediateTransaction } from "../sqlite/transaction.js";
+import { hashMemoryContent } from "../../memory/dedupe.js";
+
+/** Hard cap when metadata cannot be fully pushed to SQL (prevents O(n) RAM blowups). */
+const MAX_METADATA_SCAN = 50_000;
+const METADATA_PAGE_SIZE = 500;
+/**
+ * Multi-row INSERT chunk size. SQLite default bind limit is 999; 9 binds/row → 110.
+ * Leave headroom for side-table multi-value inserts in the same transaction.
+ */
+const BATCH_INSERT_CHUNK = 96;
+/** Max ANN overfetch when post-filtering by org/agent/archived. */
+const MAX_ANN_OVERFETCH = 8192;
+/** Coalesce concurrent single-row inserts (multi-writer throughput). */
+const INSERT_COALESCE_THRESHOLD = 24;
+const INSERT_COALESCE_MAX = 96;
 
 interface PreparedStatements {
   getMeta: StatementSync;
@@ -57,6 +81,7 @@ interface PreparedStatements {
   updateMemoryContent: StatementSync;
   getMemoryById: StatementSync;
   getMemoryByRowid: StatementSync;
+  findActiveByContentHash: StatementSync;
   insertEmbedding: StatementSync | null;
   deleteEmbedding: StatementSync | null;
   searchVectors: StatementSync | null;
@@ -69,27 +94,32 @@ interface PreparedStatements {
   deleteMemoriesByOrgAgent: StatementSync;
   insertHistory: StatementSync;
   getHistory: StatementSync;
-  countMemories: StatementSync;
-  countActiveMemories: StatementSync;
-  countArchivedMemories: StatementSync;
-  countAgents: StatementSync;
+  getStats: StatementSync;
   listRowidsForOrg: StatementSync;
   listRowidsForOrgAgent: StatementSync;
   vectorTableExists: StatementSync;
   blobTableExists: StatementSync;
   insertFts: StatementSync | null;
   deleteFts: StatementSync | null;
+  deleteFtsByOrg: StatementSync | null;
+  deleteFtsByOrgAgent: StatementSync | null;
   searchFts: StatementSync | null;
+  deleteEmbeddingsByOrg: StatementSync | null;
+  deleteEmbeddingsByOrgAgent: StatementSync | null;
+  deleteEmbeddingsBlobByOrg: StatementSync | null;
+  deleteEmbeddingsBlobByOrgAgent: StatementSync | null;
 }
 
 export interface SqliteProviderOptions {
   connectionString: string;
+  concurrency?: ConcurrencyConfig;
 }
 
 export class SqliteStorageProvider implements StorageProvider {
   readonly name = "sqlite";
 
   private readonly connectionString: string;
+  private readonly concurrency: ResolvedConcurrencyConfig;
   private db: DatabaseSync | null = null;
   private statements: PreparedStatements | null = null;
   private vectorDimensions: number | null = null;
@@ -100,14 +130,44 @@ export class SqliteStorageProvider implements StorageProvider {
   private memoryIndexDirty = false;
   /** Resolved absolute path (or `:memory:`) — avoid re-resolving on size checks. */
   private resolvedPath: string | null = null;
+  private retryLog: ((msg: string) => void) | null = null;
+  /** Cached prepared statements for `rowid IN (…)` lookups keyed by list length. */
+  private rowidInStatements = new Map<number, StatementSync>();
+  /** Cached list SQL statements keyed by clause shape. */
+  private listStatements = new Map<string, StatementSync>();
+  /** Cached multi-row insert statements keyed by row count. */
+  private batchInsertStatements = new Map<number, StatementSync>();
+  /** Cached multi-row history inserts keyed by row count. */
+  private batchHistoryStatements = new Map<number, StatementSync>();
+  /** Cached multi-row FTS inserts keyed by row count. */
+  private batchFtsStatements = new Map<number, StatementSync>();
+  /** Cached multi-row blob embedding inserts keyed by row count. */
+  private batchBlobEmbStatements = new Map<number, StatementSync>();
+  /** Coalesce concurrent insertMemory callers into one IMMEDIATE transaction. */
+  private insertQueue: Array<{
+    input: InsertMemoryInput;
+    resolve: (row: MemoryRow) => void;
+    reject: (err: unknown) => void;
+  }> = [];
+  private insertFlushScheduled = false;
 
   constructor(options: SqliteProviderOptions) {
     this.connectionString = options.connectionString;
+    this.concurrency = resolveConcurrencyConfig(options.concurrency);
   }
 
   /** Absolute or relative path / `:memory:` used by this provider. */
   get path(): string {
     return this.connectionString;
+  }
+
+  /** Expose DB for embedding cache store (same connection). */
+  getDatabase(): DatabaseSync | null {
+    return this.db;
+  }
+
+  setRetryLogger(fn: ((msg: string) => void) | null): void {
+    this.retryLog = fn;
   }
 
   async open(): Promise<void> {
@@ -128,18 +188,19 @@ export class SqliteStorageProvider implements StorageProvider {
       db.exec(`
         PRAGMA synchronous = NORMAL;
         PRAGMA foreign_keys = ON;
-        PRAGMA busy_timeout = 5000;
+        PRAGMA busy_timeout = ${this.concurrency.lockTimeoutMs};
         PRAGMA temp_store = MEMORY;
-        PRAGMA cache_size = -65536;
-        PRAGMA mmap_size = 268435456;
-        PRAGMA wal_autocheckpoint = 1000;
+        PRAGMA cache_size = -32768;
+        PRAGMA mmap_size = 134217728;
+        PRAGMA wal_autocheckpoint = 2000;
         PRAGMA recursive_triggers = OFF;
       `);
 
       this.sqliteVecLoaded = this.tryLoadSqliteVec(db);
       this.runMigrations(db);
       this.statements = this.prepareStatements(db);
-      this.ensureFtsConsistency(db);
+      // FTS consistency check only on fresh / upgraded DBs (see runMigrations).
+      // Re-scanning every warm open costs measurable ms for no benefit.
 
       const backend = this.readMetaString(META_KEYS.vectorBackend) as VectorBackend | null;
       const dims = this.readMetaNumber(META_KEYS.embeddingDimensions);
@@ -177,10 +238,21 @@ export class SqliteStorageProvider implements StorageProvider {
   }
 
   async close(): Promise<void> {
+    // Drain coalesced inserts before tearing down the connection.
+    const deadline = Date.now() + 2_000;
+    while (this.insertQueue.length > 0 && Date.now() < deadline) {
+      await this.flushInsertQueue();
+    }
     if (!this.db) {
       return;
     }
     try {
+      // Refresh query planner stats before close (cheap; measurable on large DBs).
+      try {
+        this.db.exec("PRAGMA optimize;");
+      } catch {
+        // ignore — optimize is best-effort
+      }
       this.db.close();
     } catch (error) {
       throw new DatabaseError(`Failed to close database: ${this.describe(error)}`, {
@@ -190,6 +262,12 @@ export class SqliteStorageProvider implements StorageProvider {
       this.db = null;
       this.statements = null;
       this.memoryIndex = null;
+      this.rowidInStatements.clear();
+      this.listStatements.clear();
+      this.batchInsertStatements.clear();
+      this.batchHistoryStatements.clear();
+      this.batchFtsStatements.clear();
+      this.batchBlobEmbStatements.clear();
     }
   }
 
@@ -231,8 +309,64 @@ export class SqliteStorageProvider implements StorageProvider {
   }
 
   async insertMemory(input: InsertMemoryInput): Promise<MemoryRow> {
-    const stmts = this.requireStatements();
     this.requireVectorReady();
+    // Coalesce concurrent writers into one BEGIN IMMEDIATE + multi-row insert.
+    // Without this, each remember() pays a full fsync-bound commit.
+    return new Promise<MemoryRow>((resolve, reject) => {
+      this.insertQueue.push({ input, resolve, reject });
+      if (this.insertQueue.length >= INSERT_COALESCE_THRESHOLD) {
+        this.insertFlushScheduled = false;
+        void this.flushInsertQueue();
+        return;
+      }
+      this.scheduleInsertFlush();
+    });
+  }
+
+  private scheduleInsertFlush(): void {
+    if (this.insertFlushScheduled) {
+      return;
+    }
+    this.insertFlushScheduled = true;
+    // setImmediate lets concurrent remember() callers join one IMMEDIATE tx.
+    setImmediate(() => {
+      this.insertFlushScheduled = false;
+      void this.flushInsertQueue();
+    });
+  }
+
+  private async flushInsertQueue(): Promise<void> {
+    if (this.insertQueue.length === 0) {
+      return;
+    }
+    const batch = this.insertQueue.splice(0, INSERT_COALESCE_MAX);
+    try {
+      if (batch.length === 1) {
+        const row = await this.insertMemoryImmediate(batch[0]!.input);
+        batch[0]!.resolve(row);
+      } else {
+        const rows = await this.insertMemoriesBatch(batch.map((b) => b.input));
+        for (let i = 0; i < batch.length; i += 1) {
+          batch[i]!.resolve(rows[i]!);
+        }
+      }
+    } catch (error) {
+      for (const item of batch) {
+        item.reject(error);
+      }
+    }
+    if (this.insertQueue.length > 0) {
+      void this.flushInsertQueue();
+    }
+  }
+
+  /** Single-row insert without coalescing (used by flush of size 1). */
+  private async insertMemoryImmediate(input: InsertMemoryInput): Promise<MemoryRow> {
+    const stmts = this.requireStatements();
+    const contentHash =
+      input.contentHash !== undefined
+        ? input.contentHash
+        : hashMemoryContent(input.contentText);
 
     return this.withTransaction(() => {
       const row = stmts.insertMemory.get(
@@ -241,6 +375,7 @@ export class SqliteStorageProvider implements StorageProvider {
         input.agent,
         input.contentText,
         serializeMetadata(input.metadata),
+        contentHash,
         input.createdAt,
         input.updatedAt,
       ) as unknown as MemoryRow | undefined;
@@ -273,41 +408,14 @@ export class SqliteStorageProvider implements StorageProvider {
     if (inputs.length === 0) {
       return [];
     }
-    const stmts = this.requireStatements();
     this.requireVectorReady();
 
     return this.withTransaction(() => {
       const rows: MemoryRow[] = [];
-      for (const input of inputs) {
-        const row = stmts.insertMemory.get(
-          input.id,
-          input.organization,
-          input.agent,
-          input.contentText,
-          serializeMetadata(input.metadata),
-          input.createdAt,
-          input.updatedAt,
-        ) as unknown as MemoryRow | undefined;
-        if (!row || row.rowid === undefined) {
-          throw new DatabaseError("Failed to read memory after batch insert");
-        }
-
-        this.insertEmbedding(row.rowid, input.embedding);
-        this.insertFtsRow(
-          input.id,
-          input.organization,
-          input.agent,
-          input.contentText,
-        );
-
-        stmts.insertHistory.run(
-          crypto.randomUUID(),
-          input.id,
-          "created",
-          null,
-          input.createdAt,
-        );
-        rows.push(row);
+      for (let offset = 0; offset < inputs.length; offset += BATCH_INSERT_CHUNK) {
+        const chunk = inputs.slice(offset, offset + BATCH_INSERT_CHUNK);
+        const inserted = this.insertMemoryChunk(chunk);
+        rows.push(...inserted);
       }
       return rows;
     });
@@ -329,10 +437,17 @@ export class SqliteStorageProvider implements StorageProvider {
         input.metadata !== undefined
           ? serializeMetadata(input.metadata)
           : existing.metadata_json;
+      const contentHash =
+        input.contentHash !== undefined
+          ? input.contentHash
+          : input.contentText !== undefined
+            ? hashMemoryContent(input.contentText)
+            : (existing.content_hash ?? null);
 
       stmts.updateMemoryContent.run(
         input.contentText ?? null,
         input.metadata !== undefined ? metadataJson : null,
+        contentHash,
         input.updatedAt,
         input.id,
         input.organization,
@@ -352,8 +467,30 @@ export class SqliteStorageProvider implements StorageProvider {
         );
       }
 
+      stmts.insertHistory.run(
+        crypto.randomUUID(),
+        input.id,
+        "updated",
+        null,
+        input.updatedAt,
+      );
+
       return stmts.getMemoryById.get(input.id, input.organization) as unknown as MemoryRow;
     });
+  }
+
+  async findActiveByContentHash(
+    organization: string,
+    agent: string,
+    contentHash: string,
+  ): Promise<MemoryRow | null> {
+    const stmts = this.requireStatements();
+    const row = stmts.findActiveByContentHash.get(
+      organization,
+      agent,
+      contentHash,
+    ) as unknown as MemoryRow | undefined;
+    return row ?? null;
   }
 
   async searchByMetadata(
@@ -428,14 +565,11 @@ export class SqliteStorageProvider implements StorageProvider {
     if (rowids.length === 0) {
       return out;
     }
-    const db = this.requireDb();
-    // Chunk IN lists to stay well under SQLite variable limits.
     const chunkSize = 400;
     for (let offset = 0; offset < rowids.length; offset += chunkSize) {
       const chunk = rowids.slice(offset, offset + chunkSize);
-      const placeholders = chunk.map(() => "?").join(",");
-      const sql = `${SQL.getMemoriesByRowidsPrefix}${placeholders})`;
-      const rows = db.prepare(sql).all(organization, ...chunk) as unknown as MemoryRow[];
+      const stmt = this.getRowidInStatement(chunk.length);
+      const rows = stmt.all(organization, ...chunk) as unknown as MemoryRow[];
       for (const row of rows) {
         if (row.rowid !== undefined) {
           out.set(row.rowid, row);
@@ -449,44 +583,11 @@ export class SqliteStorageProvider implements StorageProvider {
     filter: RepositoryFilter,
     limit?: number,
   ): Promise<MemoryRow[]> {
-    const db = this.requireDb();
-    const clauses: string[] = [`organization = ?`];
-    const params: Array<string | number> = [filter.organization];
-
-    if (filter.agent) {
-      clauses.push(`agent = ?`);
-      params.push(filter.agent);
-    }
-    if (!filter.includeArchived) {
-      clauses.push(`archived = 0`);
-    }
-
-    let sql = `
-      SELECT rowid, id, organization, agent, content_text, metadata_json,
-             archived, compressed_into, created_at, updated_at
-      FROM memories
-      WHERE ${clauses.join(" AND ")}
-      ORDER BY created_at ASC
-    `;
-    if (limit !== undefined && !filter.metadata) {
-      sql += ` LIMIT ?`;
-      params.push(limit);
-    }
-
     try {
-      let rows = db.prepare(sql).all(...params) as unknown as MemoryRow[];
       if (filter.metadata) {
-        rows = rows.filter((row) =>
-          matchesMetadata(
-            deserializeMetadata(row.metadata_json),
-            filter.metadata!,
-          ),
-        );
-        if (limit !== undefined) {
-          rows = rows.slice(0, limit);
-        }
+        return this.listMemoriesWithMetadata(filter, limit);
       }
-      return rows;
+      return this.listMemoriesIndexed(filter, limit);
     } catch (error) {
       throw new DatabaseError(`Failed to list memories: ${this.describe(error)}`, {
         cause: error instanceof Error ? error : undefined,
@@ -507,8 +608,8 @@ export class SqliteStorageProvider implements StorageProvider {
   }
 
   /**
-   * Org-scoped KNN + memory rows.
-   * Caller (Wolbarg.recall) already passes an overfetched topK — do not multiply again.
+   * Org-scoped KNN + memory rows with adaptive overfetch.
+   * Global ANN is post-filtered by org/agent/archived; underfill triggers larger k.
    */
   async searchVectorsWithMemories(
     embedding: Float32Array,
@@ -517,21 +618,41 @@ export class SqliteStorageProvider implements StorageProvider {
     options?: { agent?: string; includeArchived?: boolean },
   ): Promise<Array<{ row: MemoryRow; distance: number }>> {
     this.requireVectorReady();
-    const hits = await this.searchVectors(embedding, topK);
-    if (hits.length === 0) {
+    if (topK <= 0) {
       return [];
     }
-    const map = await this.getMemoriesByRowids(
-      hits.map((h) => h.memoryRowid),
-      organization,
-    );
-    const out: Array<{ row: MemoryRow; distance: number }> = [];
-    for (const hit of hits) {
-      const row = map.get(hit.memoryRowid);
-      if (!row) continue;
-      if (options?.agent && row.agent !== options.agent) continue;
-      if (!options?.includeArchived && row.archived === 1) continue;
-      out.push({ row, distance: hit.distance });
+
+    let fetchK = topK;
+    const maxFetch = Math.min(Math.max(topK * 64, 512), MAX_ANN_OVERFETCH);
+    let out: Array<{ row: MemoryRow; distance: number }> = [];
+
+    while (true) {
+      const hits = await this.searchVectors(embedding, fetchK);
+      if (hits.length === 0) {
+        return [];
+      }
+      const map = await this.getMemoriesByRowids(
+        hits.map((h) => h.memoryRowid),
+        organization,
+      );
+      out = [];
+      for (const hit of hits) {
+        const row = map.get(hit.memoryRowid);
+        if (!row) continue;
+        if (options?.agent && row.agent !== options.agent) continue;
+        if (!options?.includeArchived && row.archived === 1) continue;
+        out.push({ row, distance: hit.distance });
+        if (out.length >= topK) {
+          return out;
+        }
+      }
+      if (hits.length < fetchK) {
+        break;
+      }
+      if (fetchK >= maxFetch) {
+        break;
+      }
+      fetchK = Math.min(fetchK * 4, maxFetch);
     }
     return out;
   }
@@ -547,6 +668,9 @@ export class SqliteStorageProvider implements StorageProvider {
 
     return this.withTransaction(() => {
       for (const id of ids) {
+        const existing = stmts.getMemoryById.get(id, organization) as unknown as
+          | MemoryRow
+          | undefined;
         const result = stmts.archiveMemory.run(
           compressedIntoId,
           archivedAt,
@@ -555,7 +679,10 @@ export class SqliteStorageProvider implements StorageProvider {
         );
         if (Number(result.changes) > 0) {
           archived.push(id);
-          // Drop archived rows from FTS so keyword/hybrid never return them.
+          // Drop from ANN + FTS so recall never resurfaces archived rows.
+          if (existing?.rowid !== undefined) {
+            this.deleteEmbedding(existing.rowid);
+          }
           this.deleteFts(id);
           stmts.insertHistory.run(
             crypto.randomUUID(),
@@ -603,17 +730,8 @@ export class SqliteStorageProvider implements StorageProvider {
     }
 
     return this.withTransaction(() => {
-      const listed = this.listMemoriesSync({
-        organization: filter.organization,
-        agent,
-        includeArchived: true,
-      });
-      for (const memory of listed) {
-        if (memory.rowid !== undefined) {
-          this.deleteEmbedding(memory.rowid);
-        }
-        this.deleteFts(memory.id);
-      }
+      this.deleteEmbeddingsForScope(filter.organization, agent);
+      this.deleteFtsForScope(filter.organization, agent);
       const result = stmts.deleteMemoriesByOrgAgent.run(
         filter.organization,
         agent,
@@ -626,13 +744,8 @@ export class SqliteStorageProvider implements StorageProvider {
     const stmts = this.requireStatements();
 
     return this.withTransaction(() => {
-      const listed = this.listMemoriesSync({ organization, includeArchived: true });
-      for (const memory of listed) {
-        if (memory.rowid !== undefined) {
-          this.deleteEmbedding(memory.rowid);
-        }
-        this.deleteFts(memory.id);
-      }
+      this.deleteEmbeddingsForScope(organization);
+      this.deleteFtsForScope(organization);
       const result = stmts.deleteMemoriesByOrg.run(organization);
       return Number(result.changes);
     });
@@ -663,23 +776,17 @@ export class SqliteStorageProvider implements StorageProvider {
     totalAgents: number;
   }> {
     const stmts = this.requireStatements();
-    const memories = stmts.countMemories.get(organization) as unknown as {
-      count: number | bigint;
-    };
-    const active = stmts.countActiveMemories.get(organization) as unknown as {
-      count: number | bigint;
-    };
-    const archived = stmts.countArchivedMemories.get(organization) as unknown as {
-      count: number | bigint;
-    };
-    const agents = stmts.countAgents.get(organization) as unknown as {
-      count: number | bigint;
+    const row = stmts.getStats.get(organization) as unknown as {
+      total: number | bigint;
+      active: number | bigint;
+      archived: number | bigint;
+      agents: number | bigint;
     };
     return {
-      totalMemories: Number(memories.count),
-      activeMemories: Number(active.count),
-      archivedMemories: Number(archived.count),
-      totalAgents: Number(agents.count),
+      totalMemories: Number(row.total),
+      activeMemories: Number(row.active),
+      archivedMemories: Number(row.archived),
+      totalAgents: Number(row.agents),
     };
   }
 
@@ -719,68 +826,201 @@ export class SqliteStorageProvider implements StorageProvider {
     }
   }
 
-  withTransaction<T>(fn: () => T): T {
+  async withTransaction<T>(fn: () => T | Promise<T>): Promise<T> {
     const db = this.requireDb();
-    // DEFERRED is enough in single-threaded Node; IMMEDIATE adds lock latency.
-    db.exec("BEGIN");
-    try {
-      const result = fn();
-      db.exec("COMMIT");
-      return result;
-    } catch (error) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        // ignore rollback errors
-      }
-      if (
-        error instanceof DatabaseError ||
-        error instanceof InitializationError
-      ) {
-        throw error;
-      }
-      throw new DatabaseError(`Transaction failed: ${this.describe(error)}`, {
-        cause: error instanceof Error ? error : undefined,
-      });
-    }
+    return withImmediateTransaction(
+      db,
+      this.concurrency,
+      fn,
+      (attempt, delayMs) => {
+        this.retryLog?.(
+          `SQLITE_BUSY retry attempt=${attempt} backoffMs=${Math.round(delayMs)}`,
+        );
+      },
+    );
   }
 
   // ─── internals ───────────────────────────────────────────────────────────
 
   private tryLoadSqliteVec(db: DatabaseSync): boolean {
+    // win32-arm64 (and similar) cannot load sqlite-vec — skip the failed
+    // load attempt on every open (saves cold-start ms).
+    const plat = `${process.platform}-${process.arch}`;
+    if (SqliteStorageProvider.sqliteVecUnsupported.has(plat)) {
+      return false;
+    }
     try {
       sqliteVec.load(db);
       return true;
     } catch {
+      SqliteStorageProvider.sqliteVecUnsupported.add(plat);
       return false;
     }
   }
+
+  private static sqliteVecUnsupported = new Set<string>();
 
   private runMigrations(db: DatabaseSync): void {
     db.exec(CREATE_META_TABLE);
     db.exec(CREATE_MEMORIES_TABLE);
     db.exec(CREATE_HISTORY_TABLE);
     db.exec(CREATE_BLOB_EMBEDDINGS_TABLE);
-    for (const indexSql of CREATE_INDEXES) {
-      db.exec(indexSql);
-    }
+    db.exec(CREATE_EMBEDDING_CACHE_TABLE);
 
     const current = this.readMetaNumberFromDb(db, META_KEYS.schemaVersion);
     if (current === null) {
       db.exec(CREATE_FTS_TABLE);
       this.backfillFts(db);
+      this.migrateToV3(db);
+      for (const dropSql of DROP_REDUNDANT_INDEXES_V4) {
+        db.exec(dropSql);
+      }
+      for (const indexSql of CREATE_INDEXES) {
+        db.exec(indexSql);
+      }
       db.prepare(SQL.setMeta).run(META_KEYS.schemaVersion, String(SCHEMA_VERSION));
+      this.ensureFtsConsistency(db);
     } else if (current > SCHEMA_VERSION) {
       throw new InitializationError(
         `Database schema version ${current} is newer than this SDK (supports ${SCHEMA_VERSION}).`,
       );
     } else if (current < SCHEMA_VERSION) {
-      db.exec(CREATE_FTS_TABLE);
-      this.backfillFts(db);
+      if (current < 3) {
+        db.exec(CREATE_FTS_TABLE);
+        this.backfillFts(db);
+        this.migrateToV3(db);
+      }
+      if (current < 4) {
+        this.migrateToV4(db);
+      }
+      for (const indexSql of CREATE_INDEXES) {
+        db.exec(indexSql);
+      }
       db.prepare(SQL.setMeta).run(META_KEYS.schemaVersion, String(SCHEMA_VERSION));
-    } else {
-      db.exec(CREATE_FTS_TABLE);
+      this.ensureFtsConsistency(db);
     }
+    // current === SCHEMA_VERSION: skip index churn and FTS rescans (warm-start path).
+  }
+
+  /**
+   * Schema v4: drop unused global created_at index, strip archived vectors
+   * from ANN, add agent-active covering index (via CREATE_INDEXES).
+   */
+  private migrateToV4(db: DatabaseSync): void {
+    for (const dropSql of DROP_REDUNDANT_INDEXES_V4) {
+      db.exec(dropSql);
+    }
+
+    // Archived memories must not remain in ANN (recall post-filter waste).
+    try {
+      db.prepare(SQL.deleteArchivedEmbeddings).run();
+    } catch {
+      // vec table may not exist yet
+    }
+    try {
+      db.prepare(SQL.deleteArchivedEmbeddingsBlob).run();
+    } catch {
+      // ignore
+    }
+    this.memoryIndexDirty = true;
+  }
+
+  /**
+   * Schema v3: content_hash column, history 'updated' event, embedding_cache.
+   * SQLite cannot ALTER CHECK constraints — rebuild memory_history when needed.
+   */
+  private migrateToV3(db: DatabaseSync): void {
+    // Add content_hash if missing
+    const cols = db
+      .prepare(`PRAGMA table_info(memories)`)
+      .all() as unknown as Array<{ name: string }>;
+    const hasHash = cols.some((c) => c.name === "content_hash");
+    if (!hasHash) {
+      db.exec(`ALTER TABLE memories ADD COLUMN content_hash TEXT`);
+    }
+
+    // Backfill content_hash for active rows (newest wins on collision via unique index)
+    const active = db
+      .prepare(
+        `SELECT id, content_text, updated_at FROM memories WHERE archived = 0 ORDER BY updated_at DESC`,
+      )
+      .all() as unknown as Array<{
+      id: string;
+      content_text: string;
+      updated_at: string;
+    }>;
+    const seen = new Set<string>();
+    const updateHash = db.prepare(
+      `UPDATE memories SET content_hash = ? WHERE id = ?`,
+    );
+    for (const row of active) {
+      const hash = hashMemoryContent(row.content_text);
+      // Scope uniqueness is (org, agent, hash) — we only have id here; full
+      // uniqueness is enforced after org/agent-aware backfill below.
+      updateHash.run(hash, row.id);
+    }
+
+    // Re-backfill with org+agent awareness: null out older duplicates
+    const activeFull = db
+      .prepare(
+        `SELECT id, organization, agent, content_text, updated_at
+         FROM memories WHERE archived = 0
+         ORDER BY updated_at DESC`,
+      )
+      .all() as unknown as Array<{
+      id: string;
+      organization: string;
+      agent: string;
+      content_text: string;
+      updated_at: string;
+    }>;
+    seen.clear();
+    const clearHash = db.prepare(
+      `UPDATE memories SET content_hash = NULL WHERE id = ?`,
+    );
+    const setHash = db.prepare(
+      `UPDATE memories SET content_hash = ? WHERE id = ?`,
+    );
+    for (const row of activeFull) {
+      const hash = hashMemoryContent(row.content_text);
+      const key = `${row.organization}\0${row.agent}\0${hash}`;
+      if (seen.has(key)) {
+        clearHash.run(row.id);
+      } else {
+        seen.add(key);
+        setHash.run(hash, row.id);
+      }
+    }
+
+    // Rebuild history table to allow 'updated' in CHECK
+    this.migrateHistoryAllowUpdated(db);
+    db.exec(CREATE_EMBEDDING_CACHE_TABLE);
+  }
+
+  private migrateHistoryAllowUpdated(db: DatabaseSync): void {
+    const sql = db
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_history'`,
+      )
+      .get() as { sql?: string } | undefined;
+    if (sql?.sql?.includes("'updated'")) {
+      return;
+    }
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_history_v3 (
+        id TEXT PRIMARY KEY NOT NULL,
+        memory_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (event_type IN ('created', 'archived', 'compressed', 'updated')),
+        related_memory_id TEXT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (memory_id) REFERENCES memories(id) ON DELETE CASCADE
+      );
+      INSERT INTO memory_history_v3 (id, memory_id, event_type, related_memory_id, created_at)
+        SELECT id, memory_id, event_type, related_memory_id, created_at FROM memory_history;
+      DROP TABLE memory_history;
+      ALTER TABLE memory_history_v3 RENAME TO memory_history;
+      CREATE INDEX IF NOT EXISTS idx_history_memory_id ON memory_history(memory_id);
+    `);
   }
 
   /**
@@ -828,13 +1068,36 @@ export class SqliteStorageProvider implements StorageProvider {
   private prepareStatements(db: DatabaseSync): PreparedStatements {
     let insertFts: StatementSync | null = null;
     let deleteFts: StatementSync | null = null;
+    let deleteFtsByOrg: StatementSync | null = null;
+    let deleteFtsByOrgAgent: StatementSync | null = null;
     let searchFts: StatementSync | null = null;
     try {
       insertFts = db.prepare(SQL.insertFts);
       deleteFts = db.prepare(SQL.deleteFts);
+      deleteFtsByOrg = db.prepare(SQL.deleteFtsByOrg);
+      deleteFtsByOrgAgent = db.prepare(SQL.deleteFtsByOrgAgent);
       searchFts = db.prepare(SQL.searchFts);
     } catch {
       // FTS optional
+    }
+
+    let deleteEmbeddingsByOrg: StatementSync | null = null;
+    let deleteEmbeddingsByOrgAgent: StatementSync | null = null;
+    let deleteEmbeddingsBlobByOrg: StatementSync | null = null;
+    let deleteEmbeddingsBlobByOrgAgent: StatementSync | null = null;
+    try {
+      deleteEmbeddingsByOrg = db.prepare(SQL.deleteEmbeddingsByOrg);
+      deleteEmbeddingsByOrgAgent = db.prepare(SQL.deleteEmbeddingsByOrgAgent);
+    } catch {
+      // vec table may not exist yet
+    }
+    try {
+      deleteEmbeddingsBlobByOrg = db.prepare(SQL.deleteEmbeddingsBlobByOrg);
+      deleteEmbeddingsBlobByOrgAgent = db.prepare(
+        SQL.deleteEmbeddingsBlobByOrgAgent,
+      );
+    } catch {
+      // ignore
     }
 
     return {
@@ -844,6 +1107,7 @@ export class SqliteStorageProvider implements StorageProvider {
       updateMemoryContent: db.prepare(SQL.updateMemoryContent),
       getMemoryById: db.prepare(SQL.getMemoryById),
       getMemoryByRowid: db.prepare(SQL.getMemoryByRowid),
+      findActiveByContentHash: db.prepare(SQL.findActiveByContentHash),
       insertEmbedding: null,
       deleteEmbedding: null,
       searchVectors: null,
@@ -856,10 +1120,7 @@ export class SqliteStorageProvider implements StorageProvider {
       deleteMemoriesByOrgAgent: db.prepare(SQL.deleteMemoriesByOrgAgent),
       insertHistory: db.prepare(SQL.insertHistory),
       getHistory: db.prepare(SQL.getHistory),
-      countMemories: db.prepare(SQL.countMemories),
-      countActiveMemories: db.prepare(SQL.countActiveMemories),
-      countArchivedMemories: db.prepare(SQL.countArchivedMemories),
-      countAgents: db.prepare(SQL.countAgents),
+      getStats: db.prepare(SQL.getStats),
       listRowidsForOrg: db.prepare(SQL.listRowidsForOrg),
       listRowidsForOrgAgent: db.prepare(SQL.listRowidsForOrgAgent),
       vectorTableExists: db.prepare(SQL.vectorTableExists),
@@ -868,12 +1129,20 @@ export class SqliteStorageProvider implements StorageProvider {
       ),
       insertFts,
       deleteFts,
+      deleteFtsByOrg,
+      deleteFtsByOrgAgent,
       searchFts,
+      deleteEmbeddingsByOrg,
+      deleteEmbeddingsByOrgAgent,
+      deleteEmbeddingsBlobByOrg,
+      deleteEmbeddingsBlobByOrgAgent,
     };
   }
 
-  private listMemoriesSync(filter: RepositoryFilter): MemoryRow[] {
-    const db = this.requireDb();
+  private listMemoriesIndexed(
+    filter: RepositoryFilter,
+    limit?: number,
+  ): MemoryRow[] {
     const clauses: string[] = [`organization = ?`];
     const params: Array<string | number> = [filter.organization];
     if (filter.agent) {
@@ -883,13 +1152,358 @@ export class SqliteStorageProvider implements StorageProvider {
     if (!filter.includeArchived) {
       clauses.push(`archived = 0`);
     }
-    const sql = `
+    const key = `${filter.agent ? "a" : "_"}:${filter.includeArchived ? "A" : "0"}:${limit !== undefined ? "L" : "_"}`;
+    let stmt = this.listStatements.get(key);
+    if (!stmt) {
+      let sql = `
+        SELECT rowid, id, organization, agent, content_text, metadata_json,
+               archived, compressed_into, content_hash, created_at, updated_at
+        FROM memories
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY created_at ASC
+      `;
+      if (limit !== undefined) {
+        sql += ` LIMIT ?`;
+      }
+      stmt = this.requireDb().prepare(sql);
+      this.listStatements.set(key, stmt);
+    }
+    if (limit !== undefined) {
+      return stmt.all(...params, limit) as unknown as MemoryRow[];
+    }
+    return stmt.all(...params) as unknown as MemoryRow[];
+  }
+
+  /**
+   * Metadata-filtered list: push filters to json_extract when possible;
+   * otherwise page with a hard scan cap (never load unbounded orgs into RAM).
+   */
+  private listMemoriesWithMetadata(
+    filter: RepositoryFilter,
+    limit?: number,
+  ): MemoryRow[] {
+    const want = limit ?? MAX_METADATA_SCAN;
+    const compiled = filter.metadata
+      ? compileMetadataFilterToSql(filter.metadata)
+      : null;
+
+    if (compiled) {
+      const clauses: string[] = [`organization = ?`, `(${compiled.expression})`];
+      const params: unknown[] = [filter.organization, ...compiled.params];
+      if (filter.agent) {
+        clauses.push(`agent = ?`);
+        params.push(filter.agent);
+      }
+      if (!filter.includeArchived) {
+        clauses.push(`archived = 0`);
+      }
+      const sql = `
+        SELECT rowid, id, organization, agent, content_text, metadata_json,
+               archived, compressed_into, content_hash, created_at, updated_at
+        FROM memories
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY created_at ASC
+        LIMIT ?
+      `;
+      params.push(want);
+      return this.requireDb()
+        .prepare(sql)
+        .all(...(params as never[])) as unknown as MemoryRow[];
+    }
+
+    // Fallback: paged JS filter with hard scan ceiling.
+    const matched: MemoryRow[] = [];
+    let offset = 0;
+    const db = this.requireDb();
+    const clauses: string[] = [`organization = ?`];
+    const baseParams: Array<string | number> = [filter.organization];
+    if (filter.agent) {
+      clauses.push(`agent = ?`);
+      baseParams.push(filter.agent);
+    }
+    if (!filter.includeArchived) {
+      clauses.push(`archived = 0`);
+    }
+    const pageSql = `
       SELECT rowid, id, organization, agent, content_text, metadata_json,
-             archived, compressed_into, created_at, updated_at
+             archived, compressed_into, content_hash, created_at, updated_at
       FROM memories
       WHERE ${clauses.join(" AND ")}
+      ORDER BY created_at ASC
+      LIMIT ? OFFSET ?
     `;
-    return db.prepare(sql).all(...params) as unknown as MemoryRow[];
+    const pageStmt = db.prepare(pageSql);
+    while (matched.length < want && offset < MAX_METADATA_SCAN) {
+      const pageLimit = Math.min(METADATA_PAGE_SIZE, MAX_METADATA_SCAN - offset);
+      const page = pageStmt.all(
+        ...baseParams,
+        pageLimit,
+        offset,
+      ) as unknown as MemoryRow[];
+      if (page.length === 0) {
+        break;
+      }
+      for (const row of page) {
+        if (
+          matchesMetadata(
+            deserializeMetadata(row.metadata_json),
+            filter.metadata!,
+          )
+        ) {
+          matched.push(row);
+          if (matched.length >= want) {
+            return matched;
+          }
+        }
+      }
+      offset += page.length;
+      if (page.length < pageLimit) {
+        break;
+      }
+    }
+    return matched;
+  }
+
+  private getRowidInStatement(count: number): StatementSync {
+    let stmt = this.rowidInStatements.get(count);
+    if (!stmt) {
+      const placeholders = Array.from({ length: count }, () => "?").join(",");
+      const sql = `${SQL.getMemoriesByRowidsPrefix}${placeholders})`;
+      stmt = this.requireDb().prepare(sql);
+      this.rowidInStatements.set(count, stmt);
+    }
+    return stmt;
+  }
+
+  private insertMemoryChunk(inputs: InsertMemoryInput[]): MemoryRow[] {
+    const stmts = this.requireStatements();
+    const n = inputs.length;
+    if (n === 1) {
+      const input = inputs[0]!;
+      const contentHash =
+        input.contentHash !== undefined
+          ? input.contentHash
+          : hashMemoryContent(input.contentText);
+      const row = stmts.insertMemory.get(
+        input.id,
+        input.organization,
+        input.agent,
+        input.contentText,
+        serializeMetadata(input.metadata),
+        contentHash,
+        input.createdAt,
+        input.updatedAt,
+      ) as unknown as MemoryRow | undefined;
+      if (!row || row.rowid === undefined) {
+        throw new DatabaseError("Failed to read memory after batch insert");
+      }
+      this.insertEmbedding(row.rowid, input.embedding);
+      this.insertFtsRow(
+        input.id,
+        input.organization,
+        input.agent,
+        input.contentText,
+      );
+      stmts.insertHistory.run(
+        crypto.randomUUID(),
+        input.id,
+        "created",
+        null,
+        input.createdAt,
+      );
+      return [row];
+    }
+
+    let stmt = this.batchInsertStatements.get(n);
+    if (!stmt) {
+      const valueRow =
+        "(?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)";
+      const values = Array.from({ length: n }, () => valueRow).join(", ");
+      const sql = `
+        INSERT INTO memories (
+          id, organization, agent, content_text, metadata_json,
+          archived, compressed_into, content_hash, created_at, updated_at
+        ) VALUES ${values}
+        RETURNING rowid, id, organization, agent, content_text, metadata_json,
+                  archived, compressed_into, content_hash, created_at, updated_at
+      `;
+      stmt = this.requireDb().prepare(sql);
+      this.batchInsertStatements.set(n, stmt);
+    }
+
+    const binds: unknown[] = [];
+    for (const input of inputs) {
+      const contentHash =
+        input.contentHash !== undefined
+          ? input.contentHash
+          : hashMemoryContent(input.contentText);
+      binds.push(
+        input.id,
+        input.organization,
+        input.agent,
+        input.contentText,
+        serializeMetadata(input.metadata),
+        contentHash,
+        input.createdAt,
+        input.updatedAt,
+      );
+    }
+
+    const rows = stmt.all(...(binds as never[])) as unknown as MemoryRow[];
+    if (rows.length !== n) {
+      throw new DatabaseError("Failed to read memories after batch insert");
+    }
+    for (const row of rows) {
+      if (row.rowid === undefined) {
+        throw new DatabaseError("Failed to read memory rowid after batch insert");
+      }
+    }
+
+    // Multi-row side tables — one statement each instead of 3N run() calls.
+    this.insertEmbeddingsBatch(rows, inputs);
+    this.insertFtsBatch(inputs);
+    this.insertHistoryBatch(inputs);
+    return rows;
+  }
+
+  private insertEmbeddingsBatch(
+    rows: MemoryRow[],
+    inputs: InsertMemoryInput[],
+  ): void {
+    const n = rows.length;
+    if (this.vectorBackend === "sqlite-vec") {
+      for (let i = 0; i < n; i += 1) {
+        this.insertEmbedding(rows[i]!.rowid!, inputs[i]!.embedding);
+      }
+      return;
+    }
+    // Blob backend: multi-value INSERT + incremental in-memory index upsert.
+    let stmt = this.batchBlobEmbStatements.get(n);
+    if (!stmt) {
+      const values = Array.from({ length: n }, () => "(?, ?)").join(", ");
+      stmt = this.requireDb().prepare(
+        `INSERT INTO memory_embeddings_blob (memory_rowid, embedding) VALUES ${values}`,
+      );
+      this.batchBlobEmbStatements.set(n, stmt);
+    }
+    const binds: unknown[] = [];
+    for (let i = 0; i < n; i += 1) {
+      binds.push(rows[i]!.rowid!, embeddingToBuffer(inputs[i]!.embedding));
+    }
+    stmt.run(...(binds as never[]));
+    if (this.memoryIndex && this.vectorDimensions !== null) {
+      for (let i = 0; i < n; i += 1) {
+        this.memoryIndex.upsert(rows[i]!.rowid!, inputs[i]!.embedding);
+      }
+      this.memoryIndexDirty = false;
+    } else {
+      this.memoryIndexDirty = true;
+    }
+  }
+
+  private insertFtsBatch(inputs: InsertMemoryInput[]): void {
+    const stmts = this.requireStatements();
+    if (!stmts.insertFts) {
+      return;
+    }
+    const n = inputs.length;
+    let stmt = this.batchFtsStatements.get(n);
+    if (!stmt) {
+      const values = Array.from({ length: n }, () => "(?, ?, ?, ?)").join(", ");
+      stmt = this.requireDb().prepare(
+        `INSERT INTO memories_fts (content_text, memory_id, organization, agent) VALUES ${values}`,
+      );
+      this.batchFtsStatements.set(n, stmt);
+    }
+    const binds: unknown[] = [];
+    for (const input of inputs) {
+      binds.push(
+        input.contentText,
+        input.id,
+        input.organization,
+        input.agent,
+      );
+    }
+    try {
+      stmt.run(...(binds as never[]));
+    } catch {
+      // Fall back to per-row if FTS shape differs.
+      for (const input of inputs) {
+        this.insertFtsRow(
+          input.id,
+          input.organization,
+          input.agent,
+          input.contentText,
+        );
+      }
+    }
+  }
+
+  private insertHistoryBatch(inputs: InsertMemoryInput[]): void {
+    const n = inputs.length;
+    let stmt = this.batchHistoryStatements.get(n);
+    if (!stmt) {
+      const values = Array.from({ length: n }, () => "(?, ?, ?, ?, ?)").join(
+        ", ",
+      );
+      stmt = this.requireDb().prepare(
+        `INSERT INTO memory_history (id, memory_id, event_type, related_memory_id, created_at)
+         VALUES ${values}`,
+      );
+      this.batchHistoryStatements.set(n, stmt);
+    }
+    const binds: unknown[] = [];
+    for (const input of inputs) {
+      binds.push(
+        crypto.randomUUID(),
+        input.id,
+        "created",
+        null,
+        input.createdAt,
+      );
+    }
+    stmt.run(...(binds as never[]));
+  }
+
+  private deleteEmbeddingsForScope(
+    organization: string,
+    agent?: string,
+  ): void {
+    const stmts = this.requireStatements();
+    try {
+      if (this.vectorBackend === "sqlite-vec") {
+        if (agent) {
+          stmts.deleteEmbeddingsByOrgAgent?.run(organization, agent);
+        } else {
+          stmts.deleteEmbeddingsByOrg?.run(organization);
+        }
+      } else {
+        if (agent) {
+          stmts.deleteEmbeddingsBlobByOrgAgent?.run(organization, agent);
+        } else {
+          stmts.deleteEmbeddingsBlobByOrg?.run(organization);
+        }
+        this.memoryIndexDirty = true;
+        if (!agent) {
+          this.memoryIndex?.clear();
+        }
+      }
+    } catch {
+      // Vector table may not exist yet on a fresh DB.
+    }
+  }
+
+  private deleteFtsForScope(organization: string, agent?: string): void {
+    const stmts = this.requireStatements();
+    try {
+      if (agent) {
+        stmts.deleteFtsByOrgAgent?.run(organization, agent);
+      } else {
+        stmts.deleteFtsByOrg?.run(organization);
+      }
+    } catch {
+      // FTS optional
+    }
   }
 
   /** Insert-only FTS row (new memory IDs never collide). */
@@ -998,6 +1612,14 @@ export class SqliteStorageProvider implements StorageProvider {
       stmts.insertEmbeddingBlob = null;
       stmts.deleteEmbeddingBlob = null;
       stmts.listEmbeddingsBlob = null;
+      try {
+        stmts.deleteEmbeddingsByOrg = db.prepare(SQL.deleteEmbeddingsByOrg);
+        stmts.deleteEmbeddingsByOrgAgent = db.prepare(
+          SQL.deleteEmbeddingsByOrgAgent,
+        );
+      } catch {
+        // ignore
+      }
       return;
     }
 
@@ -1007,6 +1629,14 @@ export class SqliteStorageProvider implements StorageProvider {
     stmts.insertEmbedding = null;
     stmts.deleteEmbedding = null;
     stmts.searchVectors = null;
+    try {
+      stmts.deleteEmbeddingsBlobByOrg = db.prepare(SQL.deleteEmbeddingsBlobByOrg);
+      stmts.deleteEmbeddingsBlobByOrgAgent = db.prepare(
+        SQL.deleteEmbeddingsBlobByOrgAgent,
+      );
+    } catch {
+      // ignore
+    }
   }
 
   private insertEmbedding(rowid: number, embedding: Float32Array): void {
@@ -1016,8 +1646,13 @@ export class SqliteStorageProvider implements StorageProvider {
       return;
     }
     stmts.insertEmbeddingBlob!.run(rowid, embeddingToBuffer(embedding));
-    // Defer in-memory index rebuild until the next search (faster writes).
-    this.memoryIndexDirty = true;
+    // Keep the hot in-memory ANN index incremental — avoid O(n) rebuilds.
+    if (this.memoryIndex) {
+      this.memoryIndex.upsert(rowid, embedding);
+      this.memoryIndexDirty = false;
+    } else {
+      this.memoryIndexDirty = true;
+    }
   }
 
   private deleteEmbedding(rowid: number): void {

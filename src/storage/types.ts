@@ -14,6 +14,7 @@ export interface MemoryRow {
   metadata_json: string;
   archived: number;
   compressed_into: string | null;
+  content_hash?: string | null;
   created_at: string;
   updated_at: string;
   rowid?: number;
@@ -23,7 +24,7 @@ export interface MemoryRow {
 export interface HistoryRow {
   id: string;
   memory_id: string;
-  event_type: "created" | "archived" | "compressed";
+  event_type: "created" | "archived" | "compressed" | "updated";
   related_memory_id: string | null;
   created_at: string;
 }
@@ -38,6 +39,7 @@ export interface InsertMemoryInput {
   embedding: Float32Array;
   createdAt: string;
   updatedAt: string;
+  contentHash?: string | null;
 }
 
 /** Payload for updating memory content / metadata. */
@@ -48,6 +50,7 @@ export interface UpdateMemoryInput {
   metadata?: MemoryMetadata;
   embedding?: Float32Array;
   updatedAt: string;
+  contentHash?: string | null;
 }
 
 /** Filters used by repository queries. */
@@ -94,6 +97,16 @@ export interface StorageProvider {
 
   /** Update memory fields and optionally replace embedding. */
   updateMemory(input: UpdateMemoryInput): Promise<MemoryRow | null>;
+
+  /**
+   * Find an active (non-archived) memory by content hash within org+agent.
+   * Used by write-time exact dedupe.
+   */
+  findActiveByContentHash?(
+    organization: string,
+    agent: string,
+    contentHash: string,
+  ): Promise<MemoryRow | null>;
 
   /** Fetch a memory by UUID. */
   getMemoryById(id: string, organization: string): Promise<MemoryRow | null>;

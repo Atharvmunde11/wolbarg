@@ -5,6 +5,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-07-18
+
+### Added
+
+- **`subscribe()`** — real-time memory change events (SQLite in-process EventEmitter; Postgres LISTEN/NOTIFY with reconnect)
+- **Multi-writer SQLite concurrency** — `BEGIN IMMEDIATE`, exponential backoff retry, `concurrency` constructor config, stable error code `WOLBARG_STORAGE_LOCKED`
+- **Embedding cache** — transparent `hash(content)+model` cache with optional LRU/TTL (`embeddingCache` config); additive `cacheHit` path via cache wrapper stats
+- **Memory upsert / dedupe** — opt-in write-time exact and near-duplicate detection updates existing active memories instead of inserting (`memory.dedupe`); `RememberResult.action`; history event `"updated"`; public `update()`
+- **Schema v3** — `content_hash` column, unique active hash index, `embedding_cache` table, history CHECK allows `'updated'`
+- **Docs** — Concurrency, Real-time events, Embedding cache, Memory upsert pages
+- **Benchmarks** — `benchmark/multiprocess-levels.ts`, `benchmark/embedding-cache-bench.ts`
+
+### Changed
+
+- SQLite mutating transactions use `BEGIN IMMEDIATE` instead of deferred `BEGIN`
+- `remember()` / `rememberBatch()` return `RememberResult` (MemoryRecord + `action`) — additive field
+
+### Compatibility
+
+- All features are additive. Dedupe defaults **off**. Embedding cache defaults **on**. No required constructor changes for upgrades from 0.3.x.
+
+## [0.3.2] — 2026-07-18
+
+### Changed
+
+- **npm metadata** — `repository`, `bugs`, `homepage`, and `funding` now point at [wolbarg/wolbarg](https://github.com/wolbarg/wolbarg)
+
 ## [0.3.1] — 2026-07-17
 
 ### Fixed
@@ -33,7 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Telemetry instrumentation** — records available organization/agent/checkpoint context, persists real recall explanations, and reports measured pipeline stages without inventing recency signals
 - **Rebrand** — product renamed from AgentOrc / `agentorc` to **Wolbarg** / `wolbarg`
 - **API** — `AgentOrc` → `Wolbarg`, `AgentOrcOptions` → `WolbargOptions`, `AgentOrcError` → `WolbargError`
-- **Links** — docs and homepage now at [wolbarg.com](https://wolbarg.com); GitHub at [Atharvmunde11/wolbarg](https://github.com/Atharvmunde11/wolbarg)
+- **Links** — docs and homepage now at [wolbarg.com](https://wolbarg.com); GitHub at [wolbarg/wolbarg](https://github.com/wolbarg/wolbarg)
 - **Schema** — internal meta table renamed `agentorc_meta` → `wolbarg_meta` (new databases only; recreate or migrate existing DBs)
 
 ### Migration
@@ -120,8 +147,10 @@ const ctx = wolbarg({
 
 - Initial npm release path (pre–modular storage / ingest)
 
-[0.3.1]: https://github.com/Atharvmunde11/wolbarg/releases/tag/v0.3.1
-[0.3.0]: https://github.com/Atharvmunde11/wolbarg/releases/tag/v0.3.0
-[0.2.1]: https://github.com/Atharvmunde11/wolbarg/releases/tag/v0.2.1
-[0.2.0]: https://github.com/Atharvmunde11/wolbarg/releases/tag/v0.2.0
+[0.4.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.4.0
+[0.3.2]: https://github.com/wolbarg/wolbarg/releases/tag/v0.3.2
+[0.3.1]: https://github.com/wolbarg/wolbarg/releases/tag/v0.3.1
+[0.3.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.3.0
+[0.2.1]: https://github.com/wolbarg/wolbarg/releases/tag/v0.2.1
+[0.2.0]: https://github.com/wolbarg/wolbarg/releases/tag/v0.2.0
 [0.1.1]: https://www.npmjs.com/package/wolbarg/v/0.1.1

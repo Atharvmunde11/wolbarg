@@ -11,6 +11,7 @@ import { PostgresStorageProvider } from "./providers/postgres.js";
 
 export function createStorageProvider(
   config: StorageConfig | DatabaseConfig,
+  options?: { concurrency?: import("../types/index.js").ConcurrencyConfig },
 ): StorageProvider {
   const connectionString = resolveDatabaseUrl(config);
   if (!connectionString) {
@@ -22,6 +23,7 @@ export function createStorageProvider(
   if (config.provider === "sqlite") {
     return new SqliteStorageProvider({
       connectionString,
+      concurrency: options?.concurrency,
     });
   }
 
@@ -29,6 +31,7 @@ export function createStorageProvider(
     return new PostgresStorageProvider({
       connectionString,
       maxPoolSize: config.maxPoolSize,
+      durableWrites: config.durableWrites,
     });
   }
 

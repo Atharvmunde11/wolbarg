@@ -41,6 +41,16 @@ import {
   embedMany,
   type EmbeddingProvider,
 } from "../embedding/index.js";
+import {
+  resolveEmbeddingCacheConfig,
+  withEmbeddingCache,
+  type ResolvedEmbeddingCacheConfig,
+} from "../embedding/cache.js";
+import {
+  MemoryEmbeddingCacheStore,
+  PostgresEmbeddingCacheStore,
+  SqliteEmbeddingCacheStore,
+} from "../embedding/cache-store.js";
 import { createLlmProvider, type LlmProvider } from "../llm/index.js";
 import { loadIngestSource, resolveParser } from "../ingest/index.js";
 import type { KeywordSearchProvider } from "../keyword/index.js";
@@ -56,6 +66,12 @@ import {
   toMemoryRecord,
   toRecallResult,
 } from "../memory/index.js";
+import {
+  hashMemoryContent,
+  mergeMemoryMetadata,
+  resolveMemoryDedupeConfig,
+  type ResolvedMemoryDedupeConfig,
+} from "../memory/dedupe.js";
 import {
   SqliteMemoryTransferProvider,
   type MemoryExportResult,
@@ -90,12 +106,13 @@ import type {
   IngestOptions,
   IngestResult,
   InitOptions,
-  MemoryRecord,
+  MemoryMetadata,
   RecallExplainResponse,
   RecallExplanationHit,
   RecallOptions,
   RecallResult,
   RememberOptions,
+  RememberResult,
   RetrievalConfig,
   StatsResult,
 } from "../types/index.js";
@@ -125,10 +142,20 @@ import {
   TelemetryEmitter,
 } from "../telemetry/index.js";
 import type { PersistedRecallExplainPayload } from "../telemetry/index.js";
+import type { OperationTraceHandle } from "../telemetry/emitter.js";
 import type { CheckpointProvider } from "../providers/interfaces/CheckpointProvider.js";
 import { SqliteTelemetryProvider } from "../providers/sqlite/sqliteTelemetryProvider.js";
 import { SqliteCheckpointProvider } from "../providers/sqlite/sqliteCheckpointProvider.js";
 import { SqliteStorageProvider } from "../storage/providers/sqlite.js";
+import { PostgresStorageProvider } from "../storage/providers/postgres.js";
+import {
+  SqliteSubscribeEmitter,
+  createPostgresListenerFromPool,
+  type MemoryChangeEvent,
+  type SubscribeBackend,
+  type SubscribeFilter,
+  type Unsubscribe,
+} from "../subscribe/index.js";
 
 type ReadyState = {
   storage: StorageProvider;
@@ -158,6 +185,12 @@ export class Wolbarg<HasLlm extends boolean = false> {
   private checkpointProvider: CheckpointProvider | null = null;
   private memoryDbPath: string | null = null;
   private readonly transfer = new SqliteMemoryTransferProvider();
+  private subscribeBackend: SubscribeBackend | null = null;
+  private pgListenBackend: SubscribeBackend | null = null;
+  private memoryDedupe: ResolvedMemoryDedupeConfig = resolveMemoryDedupeConfig();
+  private embeddingCacheConfig: ResolvedEmbeddingCacheConfig =
+    resolveEmbeddingCacheConfig();
+  private rawEmbedding: EmbeddingProvider | null = null;
 
   constructor(options: WolbargOptionsWithLlm);
   constructor(options: WolbargOptionsWithoutLlm);
@@ -171,10 +204,17 @@ export class Wolbarg<HasLlm extends boolean = false> {
 
     const validated = validateWolbargOptions(options);
     this.organization = validated.organization;
+    this.memoryDedupe = resolveMemoryDedupeConfig(validated.memory?.dedupe);
+    this.embeddingCacheConfig = resolveEmbeddingCacheConfig(
+      validated.embeddingCache,
+    );
+
     const storageInput = validated.storage!;
     this.storage = isStorageProvider(storageInput)
       ? storageInput
-      : createStorageProvider(storageInput);
+      : createStorageProvider(storageInput, {
+          concurrency: validated.concurrency,
+        });
 
     if (!isStorageProvider(storageInput)) {
       this.memoryDbPath = resolveDatabaseUrl(storageInput);
@@ -182,9 +222,11 @@ export class Wolbarg<HasLlm extends boolean = false> {
       this.memoryDbPath = storageInput.path;
     }
 
-    this.embedding = isEmbeddingProvider(validated.embedding)
+    const embedding = isEmbeddingProvider(validated.embedding)
       ? validated.embedding
       : createEmbeddingProvider(validated.embedding);
+    this.rawEmbedding = embedding;
+    this.embedding = embedding;
 
     if (validated.llm) {
       this.llm = isLlmProvider(validated.llm)
@@ -202,6 +244,9 @@ export class Wolbarg<HasLlm extends boolean = false> {
     this.vision = validated.vision ?? null;
     this.chunking = validated.chunking ?? null;
     this.retrievalConfig = validated.retrieval ?? {};
+
+    // In-process subscribe backend (SQLite limitation: same process only).
+    this.subscribeBackend = new SqliteSubscribeEmitter();
 
     if (validated.telemetry) {
       if (isTelemetryProvider(validated.telemetry)) {
@@ -291,9 +336,66 @@ export class Wolbarg<HasLlm extends boolean = false> {
       await this.storage.open();
       await this.telemetry.open();
       await this.checkpointProvider?.open();
-      const probe = await this.embedding.validate();
-      await this.storage.ensureVectorSchema(probe.dimensions);
-      this.embeddingDimensions = probe.dimensions;
+
+      // Wrap embedding with transparent cache after storage is open.
+      if (this.rawEmbedding && this.embeddingCacheConfig.enabled) {
+        if (this.storage instanceof SqliteStorageProvider) {
+          const sqlite = this.storage;
+          const store = new SqliteEmbeddingCacheStore(() => sqlite.getDatabase(), {
+            ttlMs: this.embeddingCacheConfig.ttlMs,
+          });
+          this.embedding = withEmbeddingCache(
+            this.rawEmbedding,
+            store,
+            this.embeddingCacheConfig,
+          );
+        } else if (this.storage instanceof PostgresStorageProvider) {
+          // L1-only by default — durable cache must not share the insert pool
+          // (that caused cache speedup <1x under concurrent unique writes).
+          this.embedding = withEmbeddingCache(
+            this.rawEmbedding,
+            new PostgresEmbeddingCacheStore(() => null, {
+              ttlMs: this.embeddingCacheConfig.ttlMs,
+              durable: false,
+            }),
+            this.embeddingCacheConfig,
+          );
+        } else {
+          this.embedding = withEmbeddingCache(
+            this.rawEmbedding,
+            new MemoryEmbeddingCacheStore({
+              ttlMs: this.embeddingCacheConfig.ttlMs,
+            }),
+            this.embeddingCacheConfig,
+          );
+        }
+      }
+
+      // Postgres LISTEN is deferred until the first subscribe() — opening a
+      // dedicated connection on every ready() dominated cold start (~50-100ms).
+      if (this.storage instanceof PostgresStorageProvider) {
+        // Listener is created lazily in subscribe().
+      }
+
+      if (this.storage instanceof SqliteStorageProvider) {
+        this.storage.setRetryLogger((msg) => {
+          // debug-level retry visibility
+          if (typeof console !== "undefined" && console.debug) {
+            console.debug(`[wolbarg] ${msg}`);
+          }
+        });
+      }
+
+      // Prefer stored dimensions — skip embedding round-trip on warm reopen.
+      const storedDims = await this.storage.getEmbeddingDimensions();
+      if (storedDims !== null && storedDims > 0) {
+        await this.storage.ensureVectorSchema(storedDims);
+        this.embeddingDimensions = storedDims;
+      } else {
+        const probe = await this.embedding.validate();
+        await this.storage.ensureVectorSchema(probe.dimensions);
+        this.embeddingDimensions = probe.dimensions;
+      }
       this.initialized = true;
       this.telemetry.emitStartup(this.storage.name);
     } catch (error) {
@@ -314,70 +416,80 @@ export class Wolbarg<HasLlm extends boolean = false> {
     }
   }
 
-  /** Store a semantic memory for an agent. */
-  async remember(options: RememberOptions): Promise<MemoryRecord> {
+  /** Store a semantic memory for an agent (may upsert when dedupe is enabled). */
+  async remember(options: RememberOptions): Promise<RememberResult> {
     const trace = this.telemetry.start("remember");
     try {
-      const { storage, embedding, organization } = await this.requireReady();
-      assertNonEmptyString(options.agent, "agent");
-      if (!options.content || typeof options.content.text !== "string") {
-        throw new ValidationError("content.text must be a string");
-      }
-      assertNonEmptyString(options.content.text, "content.text");
-
-      const metadata = options.metadata ?? {};
-      if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
-        throw new ValidationError("metadata must be a plain object when provided");
-      }
-
-      const tEmbed = performance.now();
-      const vector = await embedding.embed(options.content.text);
-      trace.mark("embeddingMs", performance.now() - tEmbed);
-      this.assertEmbeddingDimensions(vector.length);
-
-      const id = createId();
-      const timestamp = nowIso();
-
-      const record = await this.withWriteLock(async () => {
-        const tStore = performance.now();
-        const row = await storage.insertMemory({
-          id,
-          organization,
-          agent: options.agent.trim(),
-          contentText: options.content.text,
-          metadata,
-          embedding: vector,
-          createdAt: timestamp,
-          updatedAt: timestamp,
-        });
-        trace.mark("databaseWriteMs", performance.now() - tStore);
-        return toMemoryRecord(row);
-      });
-
+      const result = await this.rememberOne(options, trace);
       trace.success({
-        provider: storage.name,
-        memoryIds: [record.id],
+        provider: this.storage?.name,
+        memoryIds: [result.id],
         returnedCount: 1,
-        embeddingProvider: embedding.model,
-        model: embedding.model,
-        metadata,
-        agentId: options.agent.trim(),
-        tags: telemetryTags(metadata),
+        embeddingProvider: this.embedding?.model,
+        model: this.embedding?.model,
+        metadata: result.metadata,
+        agentId: result.agent,
+        tags: telemetryTags(result.metadata),
+        extra: { upsertAction: result.action },
       });
-      return record;
+      return result;
     } catch (error) {
       trace.failure(error, { agentId: options.agent });
       throw wrapOperationError("remember", error);
     }
   }
 
-  /** Batch remember — one parent event + child traces per item. */
-  async rememberBatch(items: RememberOptions[]): Promise<MemoryRecord[]> {
+  /** Batch remember — sequential when dedupe enabled; otherwise one TX batch. */
+  async rememberBatch(items: RememberOptions[]): Promise<RememberResult[]> {
     const parent = this.telemetry.start("rememberBatch");
     try {
       if (!Array.isArray(items) || items.length === 0) {
         throw new ValidationError("rememberBatch requires a non-empty array");
       }
+
+      const anyDedupe = items.some((item) => {
+        const cfg = resolveMemoryDedupeConfig(
+          item.dedupe ?? this.memoryDedupe,
+        );
+        return cfg.enabled;
+      }) || this.memoryDedupe.enabled;
+
+      if (anyDedupe) {
+        const out: RememberResult[] = [];
+        for (const item of items) {
+          const child = parent.child("remember");
+          const result = await this.rememberOne(item, child);
+          child.success({
+            provider: this.storage?.name,
+            memoryIds: [result.id],
+            returnedCount: 1,
+            metadata: result.metadata,
+            agentId: result.agent,
+            tags: telemetryTags(result.metadata),
+            extra: { upsertAction: result.action },
+          });
+          out.push(result);
+        }
+        parent.success({
+          provider: this.storage?.name,
+          memoryIds: out.map((r) => r.id),
+          returnedCount: out.length,
+          embeddingProvider: this.embedding?.model,
+          model: this.embedding?.model,
+          agentId: commonAgent(items.map((item) => item.agent.trim())),
+        });
+        this.emitChange({
+          event: "remember",
+          organization: this.organization!,
+          agent: commonAgent(items.map((i) => i.agent.trim())) ?? items[0]!.agent,
+          memoryId: out.map((r) => r.id),
+          timestamp: nowIso(),
+          traceId: parent.context.traceId,
+          sessionId: this.telemetry.sessionId,
+        });
+        return out;
+      }
+
       const { storage, embedding, organization } = await this.requireReady();
 
       const tEmbed = performance.now();
@@ -405,9 +517,9 @@ export class Wolbarg<HasLlm extends boolean = false> {
         embedding: vectors[i]!,
         createdAt: timestamp,
         updatedAt: timestamp,
+        contentHash: null, // batch path is append-only; dedupe uses sequential rememberOne
       }));
 
-      // Emit child traces for waterfall debugging.
       for (let i = 0; i < inputs.length; i += 1) {
         const child = parent.child("remember");
         child.success({
@@ -427,7 +539,10 @@ export class Wolbarg<HasLlm extends boolean = false> {
         return result;
       });
 
-      const records = rows.map(toMemoryRecord);
+      const records: RememberResult[] = rows.map((row) => ({
+        ...toMemoryRecord(row),
+        action: "created" as const,
+      }));
       parent.success({
         provider: storage.name,
         memoryIds: records.map((r) => r.id),
@@ -436,11 +551,441 @@ export class Wolbarg<HasLlm extends boolean = false> {
         model: embedding.model,
         agentId: commonAgent(items.map((item) => item.agent.trim())),
       });
+      this.emitChange({
+        event: "remember",
+        organization,
+        agent: commonAgent(items.map((i) => i.agent.trim())) ?? items[0]!.agent,
+        memoryId: records.map((r) => r.id),
+        timestamp,
+        traceId: parent.context.traceId,
+        sessionId: this.telemetry.sessionId,
+      });
       return records;
     } catch (error) {
       parent.failure(error);
       throw wrapOperationError("rememberBatch", error);
     }
+  }
+
+  /**
+   * Update an existing memory by id (re-embeds when content changes).
+   */
+  async update(options: {
+    id: string;
+    content?: { text: string };
+    metadata?: MemoryMetadata;
+  }): Promise<RememberResult> {
+    const trace = this.telemetry.start("remember");
+    try {
+      const { storage, embedding, organization } = await this.requireReady();
+      assertNonEmptyString(options.id, "id");
+      const existing = await storage.getMemoryById(options.id.trim(), organization);
+      if (!existing) {
+        throw new MemoryNotFoundError(`Memory not found: ${options.id}`);
+      }
+
+      const contentText = options.content?.text ?? existing.content_text;
+      if (options.content) {
+        assertNonEmptyString(options.content.text, "content.text");
+      }
+      const existingMeta = deserializeMetadata(existing.metadata_json);
+      const metadata =
+        options.metadata !== undefined
+          ? mergeMemoryMetadata(existingMeta, options.metadata)
+          : existingMeta;
+
+      let vector: Float32Array | undefined;
+      if (options.content !== undefined) {
+        const tEmbed = performance.now();
+        vector = await embedding.embed(contentText);
+        trace.mark("embeddingMs", performance.now() - tEmbed);
+        this.assertEmbeddingDimensions(vector.length);
+      }
+
+      const timestamp = nowIso();
+      const row = await this.withWriteLock(async () => {
+        const tStore = performance.now();
+        const updated = await storage.updateMemory({
+          id: existing.id,
+          organization,
+          contentText: options.content !== undefined ? contentText : undefined,
+          metadata,
+          embedding: vector,
+          updatedAt: timestamp,
+          contentHash:
+            options.content !== undefined
+              ? hashMemoryContent(contentText)
+              : undefined,
+        });
+        trace.mark("databaseWriteMs", performance.now() - tStore);
+        return updated;
+      });
+      if (!row) {
+        throw new MemoryNotFoundError(`Memory not found: ${options.id}`);
+      }
+      const result: RememberResult = {
+        ...toMemoryRecord(row),
+        action: "updated",
+      };
+      this.emitChange({
+        event: "update",
+        organization,
+        agent: result.agent,
+        memoryId: result.id,
+        timestamp,
+        traceId: trace.context.traceId,
+        sessionId: this.telemetry.sessionId,
+        upsertAction: "updated",
+      });
+      trace.success({
+        provider: storage.name,
+        memoryIds: [result.id],
+        returnedCount: 1,
+        agentId: result.agent,
+        extra: { upsertAction: "updated" },
+      });
+      return result;
+    } catch (error) {
+      trace.failure(error);
+      throw wrapOperationError("update", error);
+    }
+  }
+
+  /**
+   * Subscribe to memory change events.
+   *
+   * **SQLite:** delivers events only within this Node.js process.
+   * A second process writing the same `memory.db` will not notify subscribers here.
+   */
+  subscribe(
+    filter: SubscribeFilter,
+    callback: (event: MemoryChangeEvent) => void,
+  ): Unsubscribe {
+    const org = filter.organization || this.organization;
+    if (!org) {
+      throw new ValidationError(
+        "subscribe requires organization (set on Wolbarg or in filter)",
+      );
+    }
+    const normalized: SubscribeFilter = {
+      ...filter,
+      organization: org,
+    };
+
+    // Postgres: lazy LISTEN — only open the dedicated connection on first subscribe.
+    if (this.storage instanceof PostgresStorageProvider) {
+      if (!this.pgListenBackend) {
+        const pool = this.storage.getPool?.();
+        if (pool) {
+          this.pgListenBackend = createPostgresListenerFromPool(pool as never);
+        }
+      }
+      if (this.pgListenBackend) {
+        // subscribe() itself kicks ensureListening — do not also void start()
+        // (that raced and leaked a second LISTEN client → duplicate events).
+        return this.pgListenBackend.subscribe(normalized, callback);
+      }
+    }
+
+    if (!this.subscribeBackend) {
+      this.subscribeBackend = new SqliteSubscribeEmitter();
+    }
+    return this.subscribeBackend.subscribe(normalized, callback);
+  }
+
+  private emitChange(event: MemoryChangeEvent): void {
+    try {
+      if (this.storage instanceof PostgresStorageProvider) {
+        // Avoid an extra pool round-trip when nobody is listening.
+        const listener = this.pgListenBackend as
+          | { hasSubscribers?: () => boolean }
+          | null;
+        if (listener?.hasSubscribers?.()) {
+          void this.storage.notifyChange(event).catch((error) => {
+            console.error(
+              "[wolbarg] NOTIFY failed:",
+              error instanceof Error ? error.message : error,
+            );
+          });
+        }
+        return;
+      }
+      this.subscribeBackend?.emit(event);
+    } catch (error) {
+      console.error(
+        "[wolbarg] emitChange error:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }
+
+  /** Internal remember with optional upsert/dedupe. */
+  private async rememberOne(
+    options: RememberOptions,
+    trace: OperationTraceHandle,
+  ): Promise<RememberResult> {
+    const { storage, embedding, organization } = await this.requireReady();
+    assertNonEmptyString(options.agent, "agent");
+    if (!options.content || typeof options.content.text !== "string") {
+      throw new ValidationError("content.text must be a string");
+    }
+    assertNonEmptyString(options.content.text, "content.text");
+
+    const metadata = options.metadata ?? {};
+    if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+      throw new ValidationError("metadata must be a plain object when provided");
+    }
+
+    const agent = options.agent.trim();
+    const text = options.content.text;
+    const dedupe = resolveMemoryDedupeConfig(
+      options.dedupe !== undefined ? options.dedupe : this.memoryDedupe,
+    );
+
+    const tEmbed = performance.now();
+    const vector = await embedding.embed(text);
+    trace.mark("embeddingMs", performance.now() - tEmbed);
+    this.assertEmbeddingDimensions(vector.length);
+
+    const timestamp = nowIso();
+    const contentHash = hashMemoryContent(text);
+
+    if (!dedupe.enabled) {
+      const id = createId();
+      const record = await this.withWriteLock(async () => {
+        const tStore = performance.now();
+        const row = await storage.insertMemory({
+          id,
+          organization,
+          agent,
+          contentText: text,
+          metadata,
+          embedding: vector,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          // Null hash when dedupe is off — unique index allows duplicate text.
+          contentHash: null,
+        });
+        trace.mark("databaseWriteMs", performance.now() - tStore);
+        return toMemoryRecord(row);
+      });
+      this.emitChange({
+        event: "remember",
+        organization,
+        agent,
+        memoryId: record.id,
+        timestamp,
+        traceId: trace.context.traceId,
+        sessionId: this.telemetry.sessionId,
+        upsertAction: "created",
+      });
+      return { ...record, action: "created" };
+    }
+
+    // Exact match
+    let existing: MemoryRow | null = null;
+    if (
+      dedupe.strategy === "exact" ||
+      dedupe.strategy === "exact-or-near"
+    ) {
+      if (typeof storage.findActiveByContentHash === "function") {
+        existing = await storage.findActiveByContentHash(
+          organization,
+          agent,
+          contentHash,
+        );
+      }
+    }
+
+    if (existing) {
+      const merged = mergeMemoryMetadata(
+        deserializeMetadata(existing.metadata_json),
+        metadata,
+      );
+      const row = await this.withWriteLock(async () => {
+        const tStore = performance.now();
+        const updated = await storage.updateMemory({
+          id: existing!.id,
+          organization,
+          metadata: merged,
+          updatedAt: timestamp,
+          contentHash,
+        });
+        trace.mark("databaseWriteMs", performance.now() - tStore);
+        return updated;
+      }, { exclusive: true });
+      const record = toMemoryRecord(row!);
+      this.emitChange({
+        event: "update",
+        organization,
+        agent,
+        memoryId: record.id,
+        timestamp,
+        traceId: trace.context.traceId,
+        sessionId: this.telemetry.sessionId,
+        upsertAction: "updated",
+      });
+      return { ...record, action: "updated" };
+    }
+
+    // Near-dup
+    if (
+      dedupe.strategy === "near" ||
+      dedupe.strategy === "exact-or-near"
+    ) {
+      const near = await this.findNearDuplicate(
+        storage,
+        organization,
+        agent,
+        vector,
+        dedupe.nearThreshold,
+        dedupe.nearCandidateLimit,
+      );
+      if (near) {
+        const merged = mergeMemoryMetadata(
+          deserializeMetadata(near.metadata_json),
+          metadata,
+        );
+        const row = await this.withWriteLock(async () => {
+          const tStore = performance.now();
+          const updated = await storage.updateMemory({
+            id: near.id,
+            organization,
+            contentText: text,
+            metadata: merged,
+            embedding: vector,
+            updatedAt: timestamp,
+            contentHash,
+          });
+          trace.mark("databaseWriteMs", performance.now() - tStore);
+          return updated;
+        }, { exclusive: true });
+        const record = toMemoryRecord(row!);
+        this.emitChange({
+          event: "update",
+          organization,
+          agent,
+          memoryId: record.id,
+          timestamp,
+          traceId: trace.context.traceId,
+          sessionId: this.telemetry.sessionId,
+          upsertAction: "updated",
+        });
+        return { ...record, action: "updated" };
+      }
+    }
+
+    // Insert new
+    const id = createId();
+    try {
+      const record = await this.withWriteLock(async () => {
+        const tStore = performance.now();
+        const row = await storage.insertMemory({
+          id,
+          organization,
+          agent,
+          contentText: text,
+          metadata,
+          embedding: vector,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+          contentHash,
+        });
+        trace.mark("databaseWriteMs", performance.now() - tStore);
+        return toMemoryRecord(row);
+      }, { exclusive: true });
+      this.emitChange({
+        event: "remember",
+        organization,
+        agent,
+        memoryId: record.id,
+        timestamp,
+        traceId: trace.context.traceId,
+        sessionId: this.telemetry.sessionId,
+        upsertAction: "created",
+      });
+      return { ...record, action: "created" };
+    } catch (error) {
+      // Unique hash race: retry as update
+      const msg = error instanceof Error ? error.message : String(error);
+      if (
+        msg.toLowerCase().includes("unique") &&
+        typeof storage.findActiveByContentHash === "function"
+      ) {
+        const raced = await storage.findActiveByContentHash(
+          organization,
+          agent,
+          contentHash,
+        );
+        if (raced) {
+          const merged = mergeMemoryMetadata(
+            deserializeMetadata(raced.metadata_json),
+            metadata,
+          );
+          const row = await this.withWriteLock(
+            async () =>
+              storage.updateMemory({
+                id: raced.id,
+                organization,
+                metadata: merged,
+                updatedAt: nowIso(),
+                contentHash,
+              }),
+            { exclusive: true },
+          );
+          const record = toMemoryRecord(row!);
+          this.emitChange({
+            event: "update",
+            organization,
+            agent,
+            memoryId: record.id,
+            timestamp: nowIso(),
+            upsertAction: "updated",
+          });
+          return { ...record, action: "updated" };
+        }
+      }
+      throw error;
+    }
+  }
+
+  private async findNearDuplicate(
+    storage: StorageProvider,
+    organization: string,
+    agent: string,
+    vector: Float32Array,
+    threshold: number,
+    limit: number,
+  ): Promise<MemoryRow | null> {
+    if (typeof storage.searchVectorsWithMemories === "function") {
+      const hits = await storage.searchVectorsWithMemories(
+        vector,
+        limit,
+        organization,
+        { agent, includeArchived: false },
+      );
+      let best: { row: MemoryRow; sim: number } | null = null;
+      for (const { row, distance } of hits) {
+        if (row.archived === 1) continue;
+        const sim = distanceToSimilarity(distance);
+        if (sim >= threshold && (!best || sim > best.sim)) {
+          best = { row, sim };
+        }
+      }
+      return best?.row ?? null;
+    }
+
+    const hits = await storage.searchVectors(vector, limit);
+    let best: { row: MemoryRow; sim: number } | null = null;
+    for (const hit of hits) {
+      const row = await storage.getMemoryByRowid(hit.memoryRowid, organization);
+      if (!row || row.archived === 1 || row.agent !== agent) continue;
+      const sim = distanceToSimilarity(hit.distance);
+      if (sim >= threshold && (!best || sim > best.sim)) {
+        best = { row, sim };
+      }
+    }
+    return best?.row ?? null;
   }
 
   /**
@@ -898,6 +1443,14 @@ export class Wolbarg<HasLlm extends boolean = false> {
         returnedCount: 1,
         agentId: options.agent.trim(),
       });
+      this.emitChange({
+        event: "compress",
+        organization,
+        agent: options.agent.trim(),
+        memoryId: [result.summary.id, ...result.archivedIds],
+        timestamp,
+        sessionId: this.telemetry.sessionId,
+      });
       return result;
     } catch (error) {
       trace.failure(error, { agentId: options.agent });
@@ -1007,9 +1560,57 @@ export class Wolbarg<HasLlm extends boolean = false> {
         embedding: vectors[i]!,
         createdAt: timestamp,
         updatedAt: timestamp,
+        contentHash: this.memoryDedupe.enabled
+          ? hashMemoryContent(chunk.text)
+          : null,
       }));
 
-      const rows = await this.withWriteLock(async () => {
+      let rows;
+      if (this.memoryDedupe.enabled) {
+        const memories: RememberResult[] = [];
+        for (let i = 0; i < chunks.length; i += 1) {
+          const result = await this.rememberOne(
+            {
+              agent: options.agent.trim(),
+              content: { text: chunks[i]!.text },
+              metadata: {
+                ...baseMeta,
+                ingest: true,
+                chunkIndex: chunks[i]!.index,
+                chunkCount: chunks.length,
+                sourceFilename: loaded.filename ?? null,
+              },
+            },
+            trace,
+          );
+          memories.push(result);
+        }
+        const result = {
+          memories,
+          extractedChars: text.length,
+          chunkCount: chunks.length,
+          usedOcr,
+          usedVision,
+        };
+        trace.success({
+          provider: storage.name,
+          memoryIds: result.memories.map((m) => m.id),
+          returnedCount: result.memories.length,
+          agentId: options.agent.trim(),
+          tags: telemetryTags(baseMeta),
+        });
+        this.emitChange({
+          event: "ingest",
+          organization,
+          agent: options.agent.trim(),
+          memoryId: result.memories.map((m) => m.id),
+          timestamp,
+          sessionId: this.telemetry.sessionId,
+        });
+        return result;
+      }
+
+      rows = await this.withWriteLock(async () => {
         const tWrite = performance.now();
         const result = await storage.insertMemoriesBatch(inputs);
         trace.mark("databaseWriteMs", performance.now() - tWrite);
@@ -1029,6 +1630,14 @@ export class Wolbarg<HasLlm extends boolean = false> {
         returnedCount: result.memories.length,
         agentId: options.agent.trim(),
         tags: telemetryTags(baseMeta),
+      });
+      this.emitChange({
+        event: "ingest",
+        organization,
+        agent: options.agent.trim(),
+        memoryId: result.memories.map((m) => m.id),
+        timestamp,
+        sessionId: this.telemetry.sessionId,
       });
       return result;
     } catch (error) {
@@ -1075,6 +1684,19 @@ export class Wolbarg<HasLlm extends boolean = false> {
         agentId:
           "filter" in options ? options.filter?.agent?.trim() ?? null : null,
       });
+      if (deleted > 0) {
+        this.emitChange({
+          event: "forget",
+          organization,
+          agent:
+            ("filter" in options && options.filter?.agent?.trim()) ||
+            ("id" in options ? "*" : "*"),
+          memoryId:
+            "id" in options && options.id ? options.id.trim() : [],
+          timestamp: nowIso(),
+          sessionId: this.telemetry.sessionId,
+        });
+      }
       return deleted;
     } catch (error) {
       trace.failure(error, {
@@ -1380,8 +2002,19 @@ export class Wolbarg<HasLlm extends boolean = false> {
     return this.telemetry.sessionId;
   }
 
-  private withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.storage?.name === "sqlite") {
+  /**
+   * Optional process-wide lock for SQLite read-modify-write (dedupe upsert).
+   * Plain inserts must NOT take this lock — the provider coalesces concurrent
+   * insertMemory calls under a single BEGIN IMMEDIATE for multi-writer throughput.
+   */
+  private withWriteLock<T>(
+    fn: () => Promise<T>,
+    options?: { exclusive?: boolean },
+  ): Promise<T> {
+    if (
+      options?.exclusive &&
+      this.storage?.name === "sqlite"
+    ) {
       return this.writeMutex.runExclusive(fn);
     }
     return fn();
@@ -1391,6 +2024,10 @@ export class Wolbarg<HasLlm extends boolean = false> {
     if (this.storage) {
       this.telemetry.emitShutdown(this.storage.name);
     }
+    await this.subscribeBackend?.close().catch(() => undefined);
+    await this.pgListenBackend?.close().catch(() => undefined);
+    this.subscribeBackend = null;
+    this.pgListenBackend = null;
     await this.telemetry.close().catch(() => undefined);
     await this.checkpointProvider?.close().catch(() => undefined);
     if (this.storage) {
@@ -1398,6 +2035,7 @@ export class Wolbarg<HasLlm extends boolean = false> {
     }
     this.storage = null;
     this.embedding = null;
+    this.rawEmbedding = null;
     this.llm = null;
     this.compression = null;
     this.organization = null;

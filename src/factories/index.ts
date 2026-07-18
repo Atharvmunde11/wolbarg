@@ -36,7 +36,14 @@ export function sqliteConfig(
 
 /** Create a PostgreSQL storage provider. Requires optional peer dependency `pg`. */
 export function postgres(
-  options: string | { connectionString: string; maxPoolSize?: number },
+  options:
+    | string
+    | {
+        connectionString: string;
+        maxPoolSize?: number;
+        /** Default true. Set false for higher write throughput (async commit). */
+        durableWrites?: boolean;
+      },
 ): StorageProvider {
   const opts =
     typeof options === "string"
@@ -48,7 +55,7 @@ export function postgres(
 /** Create a PostgreSQL storage config object. */
 export function postgresConfig(
   connectionString: string,
-  options?: { maxPoolSize?: number },
+  options?: { maxPoolSize?: number; durableWrites?: boolean },
 ): PostgresDatabaseConfig {
   return {
     provider: "postgres",
